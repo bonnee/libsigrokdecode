@@ -26,19 +26,19 @@ class SamplerateError(Exception):
 
 
 class Ann:
-    FAST_FIELD_SYNC, FAST_FIELD_STATUS, FAST_FIELD_DATA, FAST_FIELD_CRC, FAST_FIELD_ERROR, \
-        FAST_DATA, FAST_STATUS, FAST_CRC,  \
-        SLOW_ID, SLOW_DATA, SLOW_CRC, SLOW_ERROR,  \
-        SLOW_FRAME, SLOW_FRAME_ERROR = \
-        range(14)
+    FAST_STATUS, FAST_DATA, FAST_CRC,  \
+        FAST_FIELD_SYNC, FAST_FIELD_STATUS, FAST_FIELD_DATA, FAST_FIELD_CRC, FAST_FIELD_ERROR, \
+        SLOW_ERROR, \
+        SLOW_SHORT_FRAME, SLOW_ENH12_FRAME, SLOW_ENH16_FRAME, SLOW_FRAME_ERROR = \
+        range(13)
 
 
 class Decoder(srd.Decoder):
     api_version = 3
     id = 'sent'
     name = 'SENT'
-    longname = 'Single Edge Nibble Transmission'
-    desc = 'PWM-based one-way communication protocol'
+    longname = 'SAE J2716 Single Edge Nibble Transmission'
+    desc = 'Pulse-based one-way automotive communication protocol'
     license = 'gplv3+'
     inputs = ['logic']
     outputs = []
@@ -51,30 +51,29 @@ class Decoder(srd.Decoder):
          'values': ('dec', 'hex', 'oct', 'bin')},
     )
     annotations = (
+        # fast nibbles
+        ('f_status', 'Status'),
+        ('f_data', 'Data'),
+        ('f_crc', 'CRC'),
         # fast fields
-        ('ff_sync', 'Sync'),
+        ('ff_sync', 'Sync Pulse'),
         ('ff_status', 'Status'),
         ('ff_data', 'Data'),
         ('ff_crc', 'CRC'),
         ('ff_error', 'Error'),
-        # fast nibbles
-        ('f_data', 'Data'),
-        ('f_status', 'Status'),
-        ('f_crc', 'CRC'),
-        # slow data
-        ('s_id', 'ID'),
-        ('s_data', 'Data'),
-        ('s_crc', 'CRC'),
-        ('s_crc_e', 'CRC Error'),
+        # slow error
+        ('s_error', 'Error'),
         # slow frame
-        ('s_frame', 'Frame'),
+        ('s_short_frame', 'Short Frame'),
+        ('s_enh12_frame', 'Enhanced 12-bit Frame'),
+        ('s_enh16_frame', 'Enhanced 16-bit Frame'),
         ('s_frame_error', 'Frame Error')
     )
     annotation_rows = (
-        ('fields', 'Fast Fields', (Ann.FAST_FIELD_SYNC, Ann.FAST_FIELD_STATUS, Ann.FAST_FIELD_DATA, Ann.FAST_FIELD_CRC, Ann.FAST_FIELD_ERROR,)),
-        ('fast_nibbles', 'Fast Nibbles', (Ann.FAST_DATA, Ann.FAST_STATUS, Ann.FAST_CRC)),
-        ('slow_data', 'Slow Data', (Ann.SLOW_ID, Ann.SLOW_DATA, Ann.SLOW_CRC, Ann.SLOW_ERROR)),
-        ('slow_frame', 'Slow Frames', (Ann.SLOW_FRAME, Ann.SLOW_FRAME_ERROR,)),
+        ('fast_nibbles', 'Fast Nibbles', (Ann.FAST_STATUS, Ann.FAST_DATA, Ann.FAST_CRC)),
+        ('fast_fields', 'Fast Fields', (Ann.FAST_FIELD_SYNC, Ann.FAST_FIELD_STATUS, Ann.FAST_FIELD_DATA, Ann.FAST_FIELD_CRC, Ann.FAST_FIELD_ERROR,)),
+        ('slow_errors', 'Slow Errors', (Ann.SLOW_ERROR,)),
+        ('slow_frame', 'Slow Frames', (Ann.SLOW_SHORT_FRAME, Ann.SLOW_ENH12_FRAME, Ann.SLOW_ENH16_FRAME, Ann.SLOW_FRAME_ERROR,)),
     )
 
     sent = None
@@ -236,7 +235,7 @@ class SENT():
                 self.decoder.ss_block = self.decoder.captures[4]
                 self.decoder.es_block = self.decoder.captures[2]
                 self.decoder.putx([Ann.FAST_FIELD_STATUS, ['Status']])
-                self.decoder.putx([Ann.FAST_STATUS, [self.decoder.format_value(nibble_value, 4)]])
+                self.decoder.putx([Ann.FAST_STATUS, [f'{nibble_value:04b}b']])
 
                 self.data_start = self.decoder.captures[2]
                 self.state = self.State.DATA
@@ -350,13 +349,11 @@ class SlowFrame():
                 case 3:  # end of ID
                     self.decoder.ss_block = self.first_block_start
                     self.decoder.es_block = self.decoder.captures[2]
-                    self.decoder.putx([Ann.SLOW_ID, [self.decoder.format_value(self.frame_buf2 & 7, 4)]])
                 case 4:  # start of data
                     self.second_block_start = self.decoder.captures[4]
                 case 11:  # end of data
                     self.decoder.ss_block = self.second_block_start
                     self.decoder.es_block = self.decoder.captures[2]
-                    self.decoder.putx([Ann.SLOW_DATA, [self.decoder.format_value(self.frame_buf2 & 255, 8)]])
                 case 12:  # start of crc
                     self.third_block_start = self.decoder.captures[4]
                 case 15:  # end of frame
@@ -365,15 +362,15 @@ class SlowFrame():
 
                     crc_ok = False
                     data = self.frame_buf2 >> 4
-                    if self.decoder.crc4([(data >> 8) & 15, (data >> 4) & 15, data & 15], 3) == self.frame_buf2 & 15:
+                    crc = self.frame_buf2 & 15
+                    if (val := self.decoder.crc4([(data >> 8) & 15, (data >> 4) & 15, data & 15], 3)) == crc:
                         crc_ok = True
-
-                    self.decoder.putx([Ann.SLOW_CRC if crc_ok else Ann.SLOW_ERROR,
-                                       [self.decoder.format_value(self.frame_buf2 & 7, 4)]])
+                    else:
+                        self.decoder.putx([Ann.SLOW_ERROR, [f'CRC: got {self.decoder.format_value(crc, 4)}, expected {self.decoder.format_value(val,4)}']])
 
                     self.decoder.ss_block = self.first_block_start
                     self.decoder.es_block = self.decoder.captures[2]
-                    self.decoder.putx([Ann.SLOW_FRAME if crc_ok else Ann.SLOW_FRAME_ERROR,
+                    self.decoder.putx([Ann.SLOW_SHORT_FRAME if crc_ok else Ann.SLOW_FRAME_ERROR,
                                        [f'Short, ID: {self.decoder.format_value(self.frame_buf2>>(self.bit_i-3), 4)}, '
                                         f'Data: {self.decoder.format_value((self.frame_buf2>>4 )& 255, 8)}, '
                                         f'CRC: {"OK" if crc_ok else "ERROR"}']])
@@ -384,18 +381,12 @@ class SlowFrame():
             self.decoder.es_block = self.decoder.captures[2]
 
             if self.bit_i <= 5 and not self.frame_buf3 & 1:
-                self.decoder.putx([Ann.SLOW_ERROR, ['Err']])
+                self.decoder.putx([Ann.SLOW_ERROR, ['Start seq']])
                 self.abort()
-
-            # if 6 <= self.bit_i <= 17:
-            #    # compose the weird CRC sequence needed by the standard
-            #    i = self.bit_i - 5
-            #    self.crc_data[(i-1) * 2] = self.frame_buf2 & 1
-            #    self.crc_data[(i-1) * 2+1] = self.frame_buf3 & 1
 
             if self.bit_i in [6, 12, 17] and self.frame_buf3 & 1:
                 # check that bits 7, 13 and 18 of 3rd bit are 0
-                self.decoder.putx([Ann.SLOW_ERROR, ['Not 0']])
+                self.decoder.putx([Ann.SLOW_ERROR, ['bit not 0']])
                 self.abort()
 
             match self.bit_i:
@@ -403,9 +394,6 @@ class SlowFrame():
                     self.crc_end = self.decoder.captures[2]
 
                 case 6:  # start of data
-                    if self.frame_buf3 & 1:
-                        self.decoder.putx([Ann.SLOW_ERROR, ['Start seq.']])
-                        self.abort()
                     self.second_block_start = self.decoder.captures[4]
 
                 case 7:
@@ -438,18 +426,21 @@ class SlowFrame():
 
                     self.decoder.ss_block = self.first_block_start
                     self.decoder.es_block = self.crc_end
-                    self.decoder.putx([Ann.SLOW_CRC if crc_ok else Ann.SLOW_ERROR, [self.decoder.format_value(crc, 6)]])
-
-                    self.decoder.ss_block = self.second_block_start
-                    self.decoder.es_block = self.decoder.captures[2]
-                    self.decoder.putx([Ann.SLOW_DATA,
-                                       [f'ID: {self.decoder.format_value(id,id_len)}, Data: {self.decoder.format_value(data,self.enhanced_data_length)}']])
 
                     self.decoder.ss_block = self.first_block_start
                     self.decoder.es_block = self.decoder.captures[2]
-                    self.decoder.putx([Ann.SLOW_FRAME if crc_ok else Ann.SLOW_FRAME_ERROR,
+
+                    ann = Ann.SLOW_ENH16_FRAME
+                    if not crc_ok:
+                        ann = Ann.SLOW_FRAME_ERROR
+                    elif self.enhanced_data_length == 12:
+                        ann = Ann.SLOW_ENH12_FRAME
+
+                    data_f = list(data.to_bytes(2, byteorder='big'))
+                    data_f = ', '.join(map(lambda x: self.decoder.format_value(x, 4), data_f))
+                    self.decoder.putx([ann,
                                        [f'Enhanced {self.enhanced_data_length}, ID: {self.decoder.format_value(id,id_len)}, '
-                                        f'Data: [ {self.decoder.format_value(data, self.enhanced_data_length)} ], '
+                                        f'Data: [ {data_f} ], '
                                         f'CRC: {"OK" if crc_ok else "ERROR"}']])
                     self.state = self.State.IDLE
 
